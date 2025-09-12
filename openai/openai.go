@@ -43,21 +43,24 @@ type Message struct {
 }
 
 type Choice struct {
-	Index        int     `json:"index"`
-	Message      Message `json:"message"`
-	FinishReason *string `json:"finish_reason"`
+	Index        int           `json:"index"`
+	Message      Message       `json:"message"`
+	FinishReason *string       `json:"finish_reason"`
+	Logprobs     *ChatLogprobs `json:"logprobs,omitempty"`
 }
 
 type ChunkChoice struct {
-	Index        int     `json:"index"`
-	Delta        Message `json:"delta"`
-	FinishReason *string `json:"finish_reason"`
+	Index        int           `json:"index"`
+	Delta        Message       `json:"delta"`
+	FinishReason *string       `json:"finish_reason"`
+	Logprobs     *ChatLogprobs `json:"logprobs,omitempty"`
 }
 
 type CompleteChunkChoice struct {
-	Text         string  `json:"text"`
-	Index        int     `json:"index"`
-	FinishReason *string `json:"finish_reason"`
+	Text         string              `json:"text"`
+	Index        int                 `json:"index"`
+	FinishReason *string             `json:"finish_reason"`
+	Logprobs     *CompletionLogprobs `json:"logprobs,omitempty"`
 }
 
 type Usage struct {
@@ -69,6 +72,19 @@ type Usage struct {
 type ResponseFormat struct {
 	Type       string      `json:"type"`
 	JsonSchema *JsonSchema `json:"json_schema,omitempty"`
+}
+
+// CompletionLogprobs represents the logprobs format for the Completions API
+type CompletionLogprobs struct {
+	Tokens        []string             `json:"tokens"`
+	TokenLogprobs []float64            `json:"token_logprobs"`
+	TopLogprobs   []map[string]float64 `json:"top_logprobs"`
+	TextOffset    []int                `json:"text_offset"`
+}
+
+// ChatLogprobs represents the logprobs format for the Chat Completions API
+type ChatLogprobs struct {
+	Content []api.TokenLogprob `json:"content"`
 }
 
 type JsonSchema struct {
@@ -105,6 +121,10 @@ type ChatCompletionRequest struct {
 	Tools            []api.Tool      `json:"tools"`
 	Reasoning        *Reasoning      `json:"reasoning,omitempty"`
 	ReasoningEffort  *string         `json:"reasoning_effort,omitempty"`
+	// Logprobs controls whether to include log probabilities in the response
+	Logprobs *bool `json:"logprobs,omitempty"`
+	// TopLogprobs specifies how many of the most likely tokens to return
+	TopLogprobs *int `json:"top_logprobs,omitempty"`
 }
 
 type ChatCompletion struct {
@@ -141,6 +161,11 @@ type CompletionRequest struct {
 	Temperature      *float32       `json:"temperature"`
 	TopP             float32        `json:"top_p"`
 	Suffix           string         `json:"suffix"`
+	// Logprobs controls whether to include log probabilities in the response (0-5)
+	// Setting to 0 disables logprobs, 1-5 enables with the specified number of top tokens
+	Logprobs *int `json:"logprobs,omitempty"`
+	// TopLogprobs specifies how many of the most likely tokens to return
+	TopLogprobs *int `json:"top_logprobs,omitempty"`
 }
 
 type Completion struct {
@@ -253,6 +278,16 @@ func toToolCalls(tc []api.ToolCall) []ToolCall {
 	return toolCalls
 }
 
+// toChatLogprobs converts from internal logprobs format to OpenAI Chat Completions API format
+func toChatLogprobs(logprobs []api.TokenLogprob) *ChatLogprobs {
+	if len(logprobs) == 0 {
+		return nil
+	}
+	return &ChatLogprobs{
+		Content: logprobs,
+	}
+}
+
 func toChatCompletion(id string, r api.ChatResponse) ChatCompletion {
 	toolCalls := toToolCalls(r.Message.ToolCalls)
 	return ChatCompletion{
@@ -262,8 +297,9 @@ func toChatCompletion(id string, r api.ChatResponse) ChatCompletion {
 		Model:             r.Model,
 		SystemFingerprint: "fp_ollama",
 		Choices: []Choice{{
-			Index:   0,
-			Message: Message{Role: r.Message.Role, Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
+			Index:    0,
+			Message:  Message{Role: r.Message.Role, Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
+			Logprobs: toChatLogprobs(r.Message.Logprobs),
 			FinishReason: func(reason string) *string {
 				if len(toolCalls) > 0 {
 					reason = "tool_calls"
@@ -287,8 +323,9 @@ func toChunk(id string, r api.ChatResponse, toolCallSent bool) ChatCompletionChu
 		Model:             r.Model,
 		SystemFingerprint: "fp_ollama",
 		Choices: []ChunkChoice{{
-			Index: 0,
-			Delta: Message{Role: "assistant", Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
+			Index:    0,
+			Delta:    Message{Role: "assistant", Content: r.Message.Content, ToolCalls: toolCalls, Reasoning: r.Message.Thinking},
+			Logprobs: toChatLogprobs(r.Message.Logprobs),
 			FinishReason: func(reason string) *string {
 				if len(reason) > 0 {
 					if toolCallSent || len(toolCalls) > 0 {
@@ -310,6 +347,40 @@ func toUsageGenerate(r api.GenerateResponse) Usage {
 	}
 }
 
+// toCompletionLogprobs converts from Chat API logprobs format to Completions API format
+func toCompletionLogprobs(logprobs []api.TokenLogprob) *CompletionLogprobs {
+	if len(logprobs) == 0 {
+		return nil
+	}
+
+	tokens := make([]string, len(logprobs))
+	tokenLogprobs := make([]float64, len(logprobs))
+	topLogprobs := make([]map[string]float64, len(logprobs))
+	textOffset := make([]int, len(logprobs))
+
+	currentOffset := 0
+	for i, tokenData := range logprobs {
+		tokens[i] = tokenData.Token
+		tokenLogprobs[i] = tokenData.Logprob
+		textOffset[i] = currentOffset
+		currentOffset += len(tokenData.Token)
+
+		// Convert top_logprobs from array to map
+		topMap := make(map[string]float64)
+		for _, topToken := range tokenData.TopLogprobs {
+			topMap[topToken.Token] = topToken.Logprob
+		}
+		topLogprobs[i] = topMap
+	}
+
+	return &CompletionLogprobs{
+		Tokens:        tokens,
+		TokenLogprobs: tokenLogprobs,
+		TopLogprobs:   topLogprobs,
+		TextOffset:    textOffset,
+	}
+}
+
 func toCompletion(id string, r api.GenerateResponse) Completion {
 	return Completion{
 		Id:                id,
@@ -318,8 +389,9 @@ func toCompletion(id string, r api.GenerateResponse) Completion {
 		Model:             r.Model,
 		SystemFingerprint: "fp_ollama",
 		Choices: []CompleteChunkChoice{{
-			Text:  r.Response,
-			Index: 0,
+			Text:     r.Response,
+			Index:    0,
+			Logprobs: toCompletionLogprobs(r.Logprobs),
 			FinishReason: func(reason string) *string {
 				if len(reason) > 0 {
 					return &reason
@@ -339,8 +411,9 @@ func toCompleteChunk(id string, r api.GenerateResponse) CompletionChunk {
 		Model:             r.Model,
 		SystemFingerprint: "fp_ollama",
 		Choices: []CompleteChunkChoice{{
-			Text:  r.Response,
-			Index: 0,
+			Text:     r.Response,
+			Index:    0,
+			Logprobs: toCompletionLogprobs(r.Logprobs),
 			FinishReason: func(reason string) *string {
 				if len(reason) > 0 {
 					return &reason
@@ -567,6 +640,23 @@ func fromChatRequest(r ChatCompletionRequest) (*api.ChatRequest, error) {
 		}
 	}
 
+	// Validate logprobs parameters
+	if r.TopLogprobs != nil && (r.Logprobs == nil || !*r.Logprobs) {
+		return nil, errors.New("top_logprobs requires logprobs to be true")
+	}
+
+	if r.TopLogprobs != nil && (*r.TopLogprobs < 1 || *r.TopLogprobs > 20) {
+		return nil, errors.New("top_logprobs must be between 1 and 20")
+	}
+
+	// Add logprobs settings to options
+	if r.Logprobs != nil && *r.Logprobs {
+		options["logprobs"] = true
+		if r.TopLogprobs != nil {
+			options["top_logprobs"] = *r.TopLogprobs
+		}
+	}
+
 	return &api.ChatRequest{
 		Model:    r.Model,
 		Messages: messages,
@@ -645,6 +735,26 @@ func fromCompleteRequest(r CompletionRequest) (api.GenerateRequest, error) {
 		options["top_p"] = r.TopP
 	} else {
 		options["top_p"] = 1.0
+	}
+
+	// Validate logprobs parameters
+	if r.Logprobs != nil && (*r.Logprobs < 0 || *r.Logprobs > 5) {
+		return api.GenerateRequest{}, errors.New("logprobs must be between 0 and 5")
+	}
+
+	if r.TopLogprobs != nil && (*r.TopLogprobs < 1 || *r.TopLogprobs > 20) {
+		return api.GenerateRequest{}, errors.New("top_logprobs must be between 1 and 20")
+	}
+
+	// Add logprobs settings to options
+	if r.Logprobs != nil && *r.Logprobs > 0 {
+		options["logprobs"] = true
+		// Use the logprobs value as top_logprobs if top_logprobs not specified
+		if r.TopLogprobs == nil {
+			options["top_logprobs"] = *r.Logprobs
+		} else {
+			options["top_logprobs"] = *r.TopLogprobs
+		}
 	}
 
 	return api.GenerateRequest{

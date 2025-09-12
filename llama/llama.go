@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"runtime"
 	"runtime/cgo"
@@ -717,4 +718,104 @@ func (g *Grammar) Accept(token int32) {
 	}
 
 	C.grammar_accept(g.c, C.llama_token(token))
+}
+
+// GetLogitsIth returns the logits for the i-th sequence in the batch
+func (c *Context) GetLogitsIth(i int) []float32 {
+	if i < 0 {
+		return nil
+	}
+	
+	logits := C.llama_get_logits_ith(c.c, C.int32_t(i))
+	if logits == nil {
+		return nil
+	}
+
+	model := C.llama_get_model(c.c)
+	if model == nil {
+		return nil
+	}
+	
+	vocab := C.llama_model_get_vocab(model)
+	if vocab == nil {
+		return nil
+	}
+	
+	vocabSize := int(C.llama_vocab_n_tokens(vocab))
+	return unsafe.Slice((*float32)(logits), vocabSize)
+}
+
+// Softmax computes the softmax of a slice of floats
+func Softmax(logits []float32) []float32 {
+	if len(logits) == 0 {
+		return logits
+	}
+
+	// Find the maximum to prevent overflow
+	maxLogit := logits[0]
+	for _, logit := range logits[1:] {
+		if logit > maxLogit {
+			maxLogit = logit
+		}
+	}
+
+	// Compute exponentials and sum
+	result := make([]float32, len(logits))
+	var sum float32
+	for i, logit := range logits {
+		exp := float32(math.Exp(float64(logit - maxLogit)))
+		result[i] = exp
+		sum += exp
+	}
+
+	// Normalize
+	for i := range result {
+		result[i] /= sum
+	}
+
+	return result
+}
+
+// SelectTopN selects the top N tokens with their probabilities
+func SelectTopN(probs []float32, n int) []TokenData {
+	if n <= 0 || len(probs) == 0 {
+		return nil
+	}
+
+	// Create token data with indices
+	tokens := make([]TokenData, len(probs))
+	for i, prob := range probs {
+		tokens[i] = TokenData{
+			ID:    int32(i),
+			Logit: float32(math.Log(float64(prob))), // Convert back to logit
+		}
+	}
+
+	// Sort by probability (descending)
+	slices.SortFunc(tokens, func(a, b TokenData) int {
+		// Higher probability (lower negative logit) comes first
+		if a.Logit > b.Logit {
+			return -1
+		}
+		if a.Logit < b.Logit {
+			return 1
+		}
+		return 0
+	})
+
+	// Return top N
+	if n > len(tokens) {
+		n = len(tokens)
+	}
+	return tokens[:n]
+}
+
+// TokenToBytes converts a token string to its UTF-8 byte representation
+func TokenToBytes(token string) []int {
+	bytes := []byte(token)
+	result := make([]int, len(bytes))
+	for i, b := range bytes {
+		result[i] = int(b)
+	}
+	return result
 }

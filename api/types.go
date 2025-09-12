@@ -154,6 +154,8 @@ type Message struct {
 	Images    []ImageData `json:"images,omitempty"`
 	ToolCalls []ToolCall  `json:"tool_calls,omitempty"`
 	ToolName  string      `json:"tool_name,omitempty"`
+	// Logprobs contains log probability information for the generated tokens
+	Logprobs  []TokenLogprob `json:"logprobs,omitempty"`
 }
 
 func (m *Message) UnmarshalJSON(b []byte) error {
@@ -166,6 +168,21 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 	*m = Message(a)
 	m.Role = strings.ToLower(m.Role)
 	return nil
+}
+
+// TopTokenLogprob represents a single token's log probability in the top-N list
+type TopTokenLogprob struct {
+	Token   string  `json:"token"`
+	Logprob float64 `json:"logprob"`
+	Bytes   []int   `json:"bytes,omitempty"`
+}
+
+// TokenLogprob represents the log probability information for a token
+type TokenLogprob struct {
+	Token       string            `json:"token"`
+	Logprob     float64           `json:"logprob"`
+	Bytes       []int             `json:"bytes,omitempty"`
+	TopLogprobs []TopTokenLogprob `json:"top_logprobs,omitempty"`
 }
 
 type ToolCall struct {
@@ -364,6 +381,10 @@ type Options struct {
 	PresencePenalty  float32  `json:"presence_penalty,omitempty"`
 	FrequencyPenalty float32  `json:"frequency_penalty,omitempty"`
 	Stop             []string `json:"stop,omitempty"`
+
+	// Logprobs options for token probability output
+	Logprobs     bool `json:"logprobs,omitempty"`
+	TopLogprobs  int  `json:"top_logprobs,omitempty"`
 }
 
 // Runner options which must be set when the model is loaded into memory
@@ -592,6 +613,9 @@ type GenerateResponse struct {
 	Metrics
 
 	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	
+	// Logprobs contains log probability information for the generated tokens
+	Logprobs []TokenLogprob `json:"logprobs,omitempty"`
 }
 
 // ModelDetails provides details about a model.

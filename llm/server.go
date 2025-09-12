@@ -1352,6 +1352,10 @@ type CompletionRequest struct {
 	Grammar       string // set before sending the request to the subprocess
 	ParserType    parser.TokenParserType
 	PrefillString string
+	
+	// Logprobs configuration
+	Logprobs    bool // whether to collect log probabilities
+	TopLogprobs int  // number of top logprobs to collect
 }
 
 // DoneReason represents the reason why a completion response is done
@@ -1378,15 +1382,16 @@ func (d DoneReason) String() string {
 }
 
 type CompletionResponse struct {
-	Content            string         `json:"content"`
-	Thinking           string         `json:"thinking"`
-	ToolCalls          []api.ToolCall `json:"tool_calls"`
-	DoneReason         DoneReason     `json:"done_reason"`
-	Done               bool           `json:"done"`
-	PromptEvalCount    int            `json:"prompt_eval_count"`
-	PromptEvalDuration time.Duration  `json:"prompt_eval_duration"`
-	EvalCount          int            `json:"eval_count"`
-	EvalDuration       time.Duration  `json:"eval_duration"`
+	Content            string               `json:"content"`
+	Thinking           string               `json:"thinking"`
+	ToolCalls          []api.ToolCall       `json:"tool_calls"`
+	DoneReason         DoneReason           `json:"done_reason"`
+	Done               bool                 `json:"done"`
+	PromptEvalCount    int                  `json:"prompt_eval_count"`
+	PromptEvalDuration time.Duration        `json:"prompt_eval_duration"`
+	EvalCount          int                  `json:"eval_count"`
+	EvalDuration       time.Duration        `json:"eval_duration"`
+	Logprobs           []api.TokenLogprob   `json:"logprobs,omitempty"`
 }
 
 func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn func(CompletionResponse)) error {

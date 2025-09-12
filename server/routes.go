@@ -95,6 +95,20 @@ func modelOptions(model *Model, requestOpts map[string]any) (api.Options, error)
 	return opts, nil
 }
 
+// validateOptions validates the options, particularly logprobs settings
+func validateOptions(opts *api.Options) error {
+	// Validate logprobs parameters
+	if opts.TopLogprobs > 0 && !opts.Logprobs {
+		return fmt.Errorf("top_logprobs requires logprobs to be true")
+	}
+	
+	if opts.TopLogprobs < 0 || opts.TopLogprobs > 20 {
+		return fmt.Errorf("top_logprobs must be between 0 and 20")
+	}
+	
+	return nil
+}
+
 // scheduleRunner schedules a runner after validating inputs such as capabilities and model options.
 // It returns the allocated runner, model instance, and consolidated options if successful and error otherwise.
 func (s *Server) scheduleRunner(ctx context.Context, name string, caps []model.Capability, requestOpts map[string]any, keepAlive *api.Duration) (llm.LlamaServer, *Model, *api.Options, error) {
@@ -236,6 +250,12 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		return
 	}
 
+	// Validate options including logprobs settings
+	if err := validateOptions(opts); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	checkpointLoaded := time.Now()
 
 	// load the model
@@ -350,11 +370,13 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		var sb strings.Builder
 		defer close(ch)
 		if err := r.Completion(c.Request.Context(), llm.CompletionRequest{
-			Prompt:     prompt,
-			Images:     images,
-			Format:     req.Format,
-			Options:    opts,
-			ParserType: parserType,
+			Prompt:      prompt,
+			Images:      images,
+			Format:      req.Format,
+			Options:     opts,
+			ParserType:  parserType,
+			Logprobs:    opts.Logprobs,
+			TopLogprobs: opts.TopLogprobs,
 		}, func(cr llm.CompletionResponse) {
 			res := api.GenerateResponse{
 				Model:     req.Model,
@@ -363,6 +385,7 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 				Done:      cr.Done,
 				Thinking:  cr.Thinking,
 				ToolCalls: cr.ToolCalls,
+				Logprobs:  cr.Logprobs,
 				Metrics: api.Metrics{
 					PromptEvalCount:    cr.PromptEvalCount,
 					PromptEvalDuration: cr.PromptEvalDuration,
@@ -1580,6 +1603,12 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		return
 	}
 
+	// Validate options including logprobs settings
+	if err := validateOptions(opts); err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
 	checkpointLoaded := time.Now()
 
 	if len(req.Messages) == 0 {
@@ -1678,11 +1707,15 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			Options:       opts,
 			ParserType:    parserType,
 			PrefillString: prefillString,
+			Logprobs:      opts.Logprobs,
+			TopLogprobs:   opts.TopLogprobs,
 		}, func(r llm.CompletionResponse) {
+			message := api.Message{Role: "assistant", Content: r.Content, Thinking: r.Thinking, ToolCalls: r.ToolCalls, Logprobs: r.Logprobs}
+			
 			res := api.ChatResponse{
 				Model:     req.Model,
 				CreatedAt: time.Now().UTC(),
-				Message:   api.Message{Role: "assistant", Content: r.Content, Thinking: r.Thinking, ToolCalls: r.ToolCalls},
+				Message:   message,
 				Done:      r.Done,
 				Metrics: api.Metrics{
 					PromptEvalCount:    r.PromptEvalCount,

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -27,6 +28,12 @@ import (
 	"github.com/ollama/ollama/logutil"
 	"github.com/ollama/ollama/runner/common"
 )
+
+// Response represents a single response chunk from token generation
+type Response struct {
+	Text     string              `json:"text"`
+	Logprobs []api.TokenLogprob  `json:"logprobs,omitempty"`
+}
 
 // input is an element of the prompt to process, either
 // a token or an image embedding (generated from a vision projector)
@@ -53,11 +60,17 @@ type Sequence struct {
 	// tokens that have been generated but not returned yet (e.g. for stop sequences)
 	pendingResponses []string
 
+	// logprobs that have been generated but not returned yet
+	pendingLogprobs []*api.TokenLogprob
+
+	// all logprobs accumulated during generation
+	allLogprobs []api.TokenLogprob
+
 	// input cache being used by this sequence
 	cache *InputCacheSlot
 
 	// channel to send responses over
-	responses chan string
+	responses chan Response
 
 	// channel to stop decoding (such as if the remote connection is closed)
 	quit chan bool
@@ -86,6 +99,10 @@ type Sequence struct {
 	startGenerationTime time.Time
 	numDecoded          int
 	numPromptInputs     int
+
+	// Logprobs configuration
+	logprobs    bool // whether to collect log probabilities
+	topLogprobs int  // number of top logprobs to collect (0 for just the selected token)
 }
 
 type NewSequenceParams struct {
@@ -94,6 +111,8 @@ type NewSequenceParams struct {
 	numKeep        int
 	samplingParams *llama.SamplingParams
 	embedding      bool
+	logprobs       bool // whether to collect log probabilities  
+	topLogprobs    int  // number of top logprobs to collect
 }
 
 func (s *Server) NewSequence(prompt string, images []llm.ImageData, params NewSequenceParams) (*Sequence, error) {
@@ -147,13 +166,17 @@ func (s *Server) NewSequence(prompt string, images []llm.ImageData, params NewSe
 		startProcessingTime: startTime,
 		numPredict:          params.numPredict,
 		pendingResponses:    make([]string, 0),
-		responses:           make(chan string, 100),
+		pendingLogprobs:     make([]*api.TokenLogprob, 0),
+		allLogprobs:         make([]api.TokenLogprob, 0),
+		responses:           make(chan Response, 100),
 		quit:                make(chan bool, 1),
 		embedding:           make(chan []float32, 1),
 		samplingCtx:         sc,
 		embeddingOnly:       params.embedding,
 		stop:                params.stop,
 		numKeep:             params.numKeep,
+		logprobs:            params.logprobs,
+		topLogprobs:         params.topLogprobs,
 	}, nil
 }
 
@@ -279,7 +302,10 @@ func (s *Server) allNil() bool {
 
 func flushPending(seq *Sequence) bool {
 	joined := strings.Join(seq.pendingResponses, "")
+	pendingLogprobs := seq.pendingLogprobs
+	
 	seq.pendingResponses = []string{}
+	seq.pendingLogprobs = []*api.TokenLogprob{}
 
 	// Check if there are any partial UTF-8 characters remaining.
 	// We already check and queue as we are generating but some may
@@ -289,14 +315,36 @@ func flushPending(seq *Sequence) bool {
 	// This is a stricter check to ensure we never output invalid Unicode.
 	for !utf8.ValidString(joined) {
 		joined = joined[:len(joined)-1]
+		// Also remove corresponding logprob if we're truncating text
+		if len(pendingLogprobs) > 0 {
+			pendingLogprobs = pendingLogprobs[:len(pendingLogprobs)-1]
+		}
 	}
 
 	if len(joined) == 0 {
 		return true
 	}
 
+	// Dereference logprobs pointers
+	var logprobs []api.TokenLogprob
+	if seq.logprobs {
+		logprobs = make([]api.TokenLogprob, len(pendingLogprobs))
+		for i, lp := range pendingLogprobs {
+			if lp != nil {
+				logprobs[i] = *lp
+				// Accumulate all logprobs for final response
+				seq.allLogprobs = append(seq.allLogprobs, *lp)
+			}
+		}
+	}
+
+	response := Response{
+		Text:     joined,
+		Logprobs: logprobs,
+	}
+
 	select {
-	case seq.responses <- joined:
+	case seq.responses <- response:
 		return true
 	case <-seq.quit:
 		return false
@@ -478,6 +526,17 @@ func (s *Server) processBatch(tokenBatch *llama.Batch, embedBatch *llama.Batch) 
 
 		// sample a token
 		token := seq.samplingCtx.Sample(s.lc, seq.iBatch)
+		
+		// extract logprobs if requested
+		var tokenLogprob *api.TokenLogprob
+		if seq.logprobs {
+			if logprob, err := s.extractLogprobs(seq, token); err != nil {
+				slog.Warn("failed to extract logprobs", "error", err)
+			} else {
+				tokenLogprob = logprob
+			}
+		}
+		
 		seq.samplingCtx.Accept(token, true)
 		piece := s.model.TokenToPiece(token)
 
@@ -496,6 +555,9 @@ func (s *Server) processBatch(tokenBatch *llama.Batch, embedBatch *llama.Batch) 
 		seq.inputs = []input{{token: token}}
 
 		seq.pendingResponses = append(seq.pendingResponses, piece)
+		if tokenLogprob != nil {
+			seq.pendingLogprobs = append(seq.pendingLogprobs, tokenLogprob)
+		}
 		sequence := strings.Join(seq.pendingResponses, "")
 
 		if ok, stop := common.FindStop(sequence, seq.stop); ok {
@@ -583,6 +645,8 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 		numKeep:        req.Options.NumKeep,
 		samplingParams: &samplingParams,
 		embedding:      false,
+		logprobs:       req.Logprobs,
+		topLogprobs:    req.TopLogprobs,
 	})
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to create new sequence: %v", err), http.StatusInternalServerError)
@@ -630,10 +694,11 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			close(seq.quit)
 			return
-		case content, ok := <-seq.responses:
+		case response, ok := <-seq.responses:
 			if ok {
 				if err := json.NewEncoder(w).Encode(&llm.CompletionResponse{
-					Content: content,
+					Content:  response.Text,
+					Logprobs: response.Logprobs,
 				}); err != nil {
 					http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
 					close(seq.quit)
@@ -649,6 +714,7 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 					PromptEvalDuration: seq.startGenerationTime.Sub(seq.startProcessingTime),
 					EvalCount:          seq.numDecoded,
 					EvalDuration:       time.Since(seq.startGenerationTime),
+					Logprobs:           seq.allLogprobs,
 				}); err != nil {
 					http.Error(w, fmt.Sprintf("failed to encode final response: %v", err), http.StatusInternalServerError)
 				}
@@ -657,6 +723,50 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// extractLogprobs extracts log probability information for the given token
+func (s *Server) extractLogprobs(seq *Sequence, selectedToken int) (*api.TokenLogprob, error) {
+	// Get logits from the llama context for this sequence's batch position
+	logits := s.lc.GetLogitsIth(seq.iBatch)
+	if logits == nil {
+		return nil, errors.New("failed to get logits")
+	}
+
+	// Convert logits to probabilities using softmax
+	probs := llama.Softmax(logits)
+	
+	// Get the token string
+	tokenStr := s.model.TokenToPiece(selectedToken)
+	
+	// Calculate the log probability of the selected token
+	// Log probability = log(probability)
+	selectedLogprob := math.Log(float64(probs[selectedToken]))
+	
+	// Create the basic token logprob
+	tokenLogprob := &api.TokenLogprob{
+		Token:   tokenStr,
+		Logprob: selectedLogprob,
+		Bytes:   llama.TokenToBytes(tokenStr),
+	}
+
+	// If top logprobs are requested, extract them
+	if seq.topLogprobs > 0 {
+		topTokens := llama.SelectTopN(probs, seq.topLogprobs)
+		tokenLogprob.TopLogprobs = make([]api.TopTokenLogprob, len(topTokens))
+		
+		for i, topToken := range topTokens {
+			topTokenStr := s.model.TokenToPiece(int(topToken.ID))
+			// TokenData.Logit is actually log probability (despite the name)
+			tokenLogprob.TopLogprobs[i] = api.TopTokenLogprob{
+				Token:   topTokenStr,
+				Logprob: float64(topToken.Logit),
+				Bytes:   llama.TokenToBytes(topTokenStr),
+			}
+		}
+	}
+
+	return tokenLogprob, nil
 }
 
 func (s *Server) embeddings(w http.ResponseWriter, r *http.Request) {
